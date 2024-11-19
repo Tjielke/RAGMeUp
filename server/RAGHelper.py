@@ -19,7 +19,7 @@ from langchain_milvus.vectorstores import Milvus
 from langchain_postgres.vectorstores import PGVector
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from lxml import etree
-from PostgresBM25Retriever import PostgresBM25Retriever
+from Neo4jRetriever import Neo4jRetriever
 from ScoredCrossEncoderReranker import ScoredCrossEncoderReranker
 from tqdm import tqdm
 
@@ -44,18 +44,17 @@ class RAGHelper:
         self.rerank_retriever = None
         self._batch_size = 1000
         # Load environment variables
-        self.vector_store_sparse_uri = os.getenv('vector_store_sparse_uri')
-        self.vector_store_uri = os.getenv('vector_store_uri')
+        self.neo4j_uri = os.getenv("neo4j_uri")
+        self.neo4j_user = os.getenv("neo4j_user")
+        self.neo4j_password = os.getenv("neo4j_password")
+        self.retriever_k = int(os.getenv("retriever_k"))
         self.document_chunks_pickle = os.getenv('document_chunks_pickle')
         self.data_dir = os.getenv('data_directory')
         self.file_types = os.getenv("file_types").split(",")
         self.splitter_type = os.getenv('splitter')
-        self.vector_store = os.getenv("vector_store")
-        self.vector_store_initial_load = os.getenv("vector_store_initial_load") == "True"
         self.rerank = os.getenv("rerank") == "True"
         self.rerank_model = os.getenv("rerank_model")
         self.rerank_k = int(os.getenv("rerank_k"))
-        self.vector_store_k = int(os.getenv("vector_store_k"))
         self.chunk_size = int(os.getenv("chunk_size"))
         self.chunk_overlap = int(os.getenv("chunk_overlap"))
         self.breakpoint_threshold_amount = os.getenv('breakpoint_threshold_amount', 'None')
@@ -86,9 +85,11 @@ class RAGHelper:
 
     def _load_chunked_documents(self):
         """Loads previously chunked documents from a pickle file."""
-        with open(self.document_chunks_pickle, 'rb') as f:
-            self.logger.info("Loading chunked documents.")
-            self.chunked_documents = pickle.load(f)
+        if os.path.exists(self.document_chunks_pickle):
+            with open(self.document_chunks_pickle, 'rb') as f:
+                self.chunked_documents = pickle.load(f)
+        else:
+            self.logger.info("No existing document chunks found. Starting fresh.")
 
     def _load_json_files(self):
         """
@@ -359,32 +360,21 @@ class RAGHelper:
             use_jsonb=True
         )
 
-    def _initialize_vector_store(self):
-        """Initializes the vector store based on the specified type (Milvus or Postgres)."""
-        if self.vector_store == "milvus":
-            self._initialize_milvus()
-        elif self.vector_store == "postgres":
-            self._initialize_postgres()
-        else:
-            raise ValueError(
-                "Only 'milvus' or 'postgres' are supported as vector stores! Please set vector_store in your "
-                "environment variables.")
-        if self.vector_store_initial_load:
-            self.logger.info("Loading data from existing store.")
-            # Add the documents 1 by 1, so we can track progress
-            with tqdm(total=len(self.chunked_documents), desc="Vectorizing documents") as pbar:
-                for i in range(0, len(self.chunked_documents), self._batch_size):
-                    # Slice the documents for the current batch
-                    batch = self.chunked_documents[i:i + self._batch_size]
-                    # Prepare documents and their IDs for batch insertion
-                    documents = [d for d in batch]
-                    ids = [d.metadata["id"] for d in batch]
-
-                    # Add the batch of documents to the database
-                    self.db.add_documents(documents, ids=ids)
-
-                    # Update the progress bar by the size of the batch
-                    pbar.update(len(batch))
+    def _initialize_neo4j_retriever(self):
+        """Initializes the Neo4j database retriever."""
+        self.logger.info("Setting up Neo4j database.")
+        self.sparse_retriever = Neo4jRetriever(
+            uri=self.neo4j_uri,
+            user=self.neo4j_user,
+            password=self.neo4j_password,
+            k=self.retriever_k
+        )
+        if os.getenv("initial_load") == "True":
+            self.logger.info("Loading data into Neo4j retriever.")
+            with tqdm(total=len(self.chunked_documents), desc="Uploading documents to Neo4j") as pbar:
+                for d in self.chunked_documents:
+                    self.sparse_retriever.add_documents([d], ids=[d.metadata["id"]])
+                    pbar.update(1)
 
     def _initialize_bm25retriever(self):
         """Initializes in memory BM25Retriever."""
@@ -395,27 +385,20 @@ class RAGHelper:
         )
 
     def _initialize_postgresbm25retriever(self):
-        """Initializes in memory PostgresBM25Retriever."""
-        self.logger.info("Initializing PostgresBM25Retriever.")
-        self.sparse_retriever = PostgresBM25Retriever(connection_uri=self.vector_store_sparse_uri,
+        """Initializes in memory Neo4jRetriever."""
+        self.logger.info("Initializing Neo4jRetriever.")
+        self.sparse_retriever = Neo4jRetriever(connection_uri=self.vector_store_sparse_uri,
                                                       table_name="sparse_vectors", k=self.vector_store_k)
         if self.vector_store_initial_load == "True":
-            self.logger.info("Loading data from existing store into the PostgresBM25Retriever.")
+            self.logger.info("Loading data from existing store into the Neo4jRetriever.")
             with tqdm(total=len(self.chunked_documents), desc="Vectorizing documents") as pbar:
                 for d in self.chunked_documents:
                     self.sparse_retriever.add_documents([d], ids=[d.metadata["id"]])
                     pbar.update(1)
 
     def _initialize_retrievers(self):
-        """Initializes the sparse retriever, ensemble retriever, and rerank retriever."""
-        if self.vector_store == "milvus":
-            self._initialize_bm25retriever()
-        elif self.vector_store == "postgres":
-            self._initialize_postgresbm25retriever()
-        else:
-            raise ValueError(
-                "Only 'milvus' or 'postgres' are supported as vector stores! Please set vector_store in your "
-                "environment variables.")
+        """Sets up the retrievers for the pipeline."""
+        self._initialize_neo4j_retriever()
 
     def _initialize_reranker(self):
         """Initialize the reranking model based on environment settings."""
@@ -465,7 +448,7 @@ class RAGHelper:
 
         documents = [d for d in new_chunks]
         ids = [d.metadata["id"] for d in new_chunks]
-        self.db.add_documents(documents, ids=ids)
+        self.sparse_retriever.add_documents(documents, ids=ids)
 
         if self.vector_store == "postgres":
             self.sparse_retriever.add_documents(new_chunks)
